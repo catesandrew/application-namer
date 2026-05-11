@@ -1,122 +1,121 @@
 import type { NameContext } from "@/lib/types";
 
-const HEALTH_CHECK_TIMEOUT_MS = 2000;
-
-interface McpResponse {
-  result?: {
-    content?: Array<{ type: string; text?: string }>;
-  };
-  error?: { message: string };
-}
-
-function buildPrompt(name: string, context: NameContext): string {
-  return `Suggest 8 creative, memorable alternative names for a software project called "${name}".
+const SUGGESTION_PROMPT_TEMPLATE = (name: string, context: NameContext) =>
+  `Suggest 8 creative, memorable alternative names for a software project called "${name}".
 
 Context: This name is already taken on: ${context.takenOn.join(", ")}.
 
-Requirements:
+Requirements for suggestions:
 - Each name should be a single word or hyphenated (valid package name: lowercase, alphanumeric, hyphens)
 - Names should be memorable, easy to spell, and related to the original concept
 - Avoid generic prefixes like "my-" or "the-"
 - Mix approaches: synonyms, metaphors, portmanteaus, related concepts
-Return ONLY a JSON array of strings.`;
-}
 
-async function callMcpAsk(
+Return ONLY a JSON array of strings, e.g.: ["name1", "name2", ...]`;
+
+/**
+ * MCP Bridge provider factory for mcp-agent-bridge servers.
+ *
+ * Integrates with catesandrew/mcp-agent-bridge which provides MCP servers
+ * for Claude, Codex, and Copilot CLIs via Streamable HTTP transport.
+ *
+ * - Claude server (default :8940): `ask` tool with `{ question }` param
+ * - Codex server (default :8941): `codex` tool with `{ prompt }` param
+ * - Copilot server (default :8945): `ask` tool with `{ question }` param
+ */
+export function mcpBridgeProvider(
   serverUrl: string,
-  question: string,
-  signal?: AbortSignal
-): Promise<string> {
-  const response = await fetch(`${serverUrl}/mcp`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      method: "tools/call",
-      params: { name: "ask", arguments: { question } },
-      id: 1,
-    }),
-    signal,
-  });
+  serverName: string,
+  toolConfig: { toolName: string; paramName: string }
+) {
+  async function callMcpTool(prompt: string): Promise<string> {
+    const url = `${serverUrl}/mcp`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "tools/call",
+        params: {
+          name: toolConfig.toolName,
+          arguments: { [toolConfig.paramName]: prompt },
+        },
+        id: 1,
+      }),
+      signal: AbortSignal.timeout(30_000),
+    });
 
-  if (!response.ok) {
-    throw new Error(`MCP bridge returned ${response.status}`);
-  }
-
-  const data = (await response.json()) as McpResponse;
-
-  if (data.error) {
-    throw new Error(data.error.message);
-  }
-
-  const content = data.result?.content;
-  if (Array.isArray(content)) {
-    const textBlock = content.find(
-      (c) => c.type === "text" && typeof c.text === "string"
-    );
-    if (textBlock?.text) {
-      return textBlock.text;
-    }
-  }
-
-  return "";
-}
-
-function extractNamesFromText(text: string): string[] {
-  // Try direct JSON parse first
-  try {
-    const parsed = JSON.parse(text) as unknown;
-    if (Array.isArray(parsed)) {
-      return parsed.filter((n): n is string => typeof n === "string");
-    }
-  } catch {
-    // fall through to pattern matching
-  }
-
-  // Look for array pattern in text
-  const match = text.match(/\[[\s\S]*?\]/);
-  if (match) {
-    try {
-      const parsed = JSON.parse(match[0]) as unknown;
-      if (Array.isArray(parsed)) {
-        return parsed.filter((n): n is string => typeof n === "string");
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  return [];
-}
-
-export function mcpBridgeProvider(serverUrl: string, serverName: string) {
-  return {
-    serverUrl,
-    serverName,
-
-    async isAvailable(): Promise<boolean> {
-      const controller = new AbortController();
-      const timer = setTimeout(
-        () => controller.abort(),
-        HEALTH_CHECK_TIMEOUT_MS
+    if (!response.ok) {
+      throw new Error(
+        `MCP bridge ${serverName} returned ${response.status}: ${response.statusText}`
       );
+    }
+
+    const json = await response.json();
+
+    // MCP JSON-RPC response: { result: { content: [{ type: "text", text: "..." }] } }
+    const text =
+      json?.result?.content?.[0]?.text ??
+      json?.result?.result ??
+      json?.result ??
+      "";
+
+    if (typeof text !== "string") {
+      throw new Error(`Unexpected response format from ${serverName}`);
+    }
+
+    return text;
+  }
+
+  function extractJsonArray(text: string): string[] {
+    // Try direct JSON parse first
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) return parsed.filter((s) => typeof s === "string");
+      if (parsed?.suggestions && Array.isArray(parsed.suggestions))
+        return parsed.suggestions.filter((s: unknown) => typeof s === "string");
+    } catch {
+      // Fall through to regex extraction
+    }
+
+    // Extract JSON array from text (AI responses sometimes wrap in markdown)
+    const match = text.match(/\[[\s\S]*?\]/);
+    if (match) {
       try {
-        await fetch(`${serverUrl}/mcp`, {
+        const parsed = JSON.parse(match[0]);
+        if (Array.isArray(parsed))
+          return parsed.filter((s) => typeof s === "string");
+      } catch {
+        // Could not parse extracted array
+      }
+    }
+
+    return [];
+  }
+
+  return {
+    async isAvailable(): Promise<boolean> {
+      try {
+        const response = await fetch(`${serverUrl}/mcp`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
           body: JSON.stringify({
             jsonrpc: "2.0",
-            method: "tools/call",
-            params: { name: "ask", arguments: { question: "ping" } },
+            method: "tools/list",
+            params: {},
             id: 0,
           }),
-          signal: controller.signal,
+          signal: AbortSignal.timeout(2_000),
         });
-        return true;
+        return response.ok;
       } catch {
         return false;
-      } finally {
-        clearTimeout(timer);
       }
     },
 
@@ -124,12 +123,28 @@ export function mcpBridgeProvider(serverUrl: string, serverName: string) {
       name: string,
       context: NameContext
     ): Promise<string[]> {
-      try {
-        const text = await callMcpAsk(serverUrl, buildPrompt(name, context));
-        return extractNamesFromText(text);
-      } catch {
-        return [];
-      }
+      const prompt = SUGGESTION_PROMPT_TEMPLATE(name, context);
+      const responseText = await callMcpTool(prompt);
+      return extractJsonArray(responseText);
     },
   };
 }
+
+// Pre-configured providers for mcp-agent-bridge servers
+export const mcpClaudeProvider = mcpBridgeProvider(
+  process.env.MCP_CLAUDE_URL ?? "http://localhost:8960",
+  "Claude MCP",
+  { toolName: "ask", paramName: "question" }
+);
+
+export const mcpCodexProvider = mcpBridgeProvider(
+  process.env.MCP_CODEX_URL ?? "http://localhost:8961",
+  "Codex MCP",
+  { toolName: "codex", paramName: "prompt" }
+);
+
+export const mcpCopilotProvider = mcpBridgeProvider(
+  process.env.MCP_COPILOT_URL ?? "http://localhost:8962",
+  "Copilot MCP",
+  { toolName: "ask", paramName: "question" }
+);

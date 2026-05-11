@@ -1,20 +1,11 @@
 import type { NameContext, ProviderInfo } from "@/lib/types";
 import { claudeProvider } from "./claude";
 import { openaiProvider } from "./openai";
-import { mcpBridgeProvider } from "./mcp-bridge";
-
-const mcpClaudeProvider = mcpBridgeProvider(
-  process.env.MCP_CLAUDE_URL ?? "http://localhost:8940",
-  "Claude MCP"
-);
-const mcpCodexProvider = mcpBridgeProvider(
-  process.env.MCP_CODEX_URL ?? "http://localhost:8941",
-  "Codex MCP"
-);
-const mcpCopilotProvider = mcpBridgeProvider(
-  process.env.MCP_COPILOT_URL ?? "http://localhost:8945",
-  "Copilot MCP"
-);
+import {
+  mcpClaudeProvider,
+  mcpCodexProvider,
+  mcpCopilotProvider,
+} from "./mcp-bridge";
 
 export async function getAvailableProviders(): Promise<ProviderInfo[]> {
   const [mcpClaudeAvailable, mcpCodexAvailable, mcpCopilotAvailable] =
